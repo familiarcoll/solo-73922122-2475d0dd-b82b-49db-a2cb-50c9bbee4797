@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -38,12 +40,17 @@ from app.errors import (
 from app.fhir_utils import etag, parse_etag
 from app.models import (
     DiagnosticReport,
-    IdempotencyRecord,
     Observation,
     Patient,
     PatientIdentifier,
     ReportLink,
     ResourceVersion,
+)
+from app.services.idempotency import (
+    SlotLease,
+    acquire_slot,
+    complete_slot,
+    release_slot,
 )
 
 ALLOWED_TYPES = {"Patient", "Observation", "DiagnosticReport"}
@@ -304,63 +311,6 @@ def _resolve_urn_references(entries: list[ParsedEntry]) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Idempotency ledger
-# --------------------------------------------------------------------------- #
-
-def acquire_idempotency_slot(session: Session, key: str, hash_value: str) -> dict | None:
-    """Return a stored completed response to replay, or None to proceed.
-
-    Uses its own committed transaction so a crash mid-processing leaves a
-    recoverable 'pending' marker rather than a half-applied bundle.
-    """
-    while True:
-        record = IdempotencyRecord(key=key, content_hash=hash_value, state="pending")
-        session.add(record)
-        try:
-            session.commit()
-            return None
-        except IntegrityError:
-            session.rollback()
-            existing = session.get(IdempotencyRecord, key)
-            if existing is None:  # pragma: no cover - extremely rare race
-                continue
-            if existing.state == "completed":
-                if existing.content_hash != hash_value:
-                    raise conflict(
-                        f"Idempotency-Key '{key}' was already submitted with different "
-                        f"content; reuse the key only for identical retries."
-                    )
-                return existing.response  # type: ignore[return-value]
-            # pending: either a live concurrent request or a crashed orphan.
-            # Only a *fresh* marker blocks; once it is older than the stale
-            # threshold the owning process is presumed crashed and the slot is
-            # recovered regardless of payload hash (a crashed request's hash is
-            # normally different from the retry anyway).
-            updated_at = existing.updated_at
-            if updated_at.tzinfo is None:  # SQLite stores naive datetimes
-                updated_at = updated_at.replace(tzinfo=timezone.utc)
-            age = (datetime.now(timezone.utc) - updated_at).total_seconds()
-            if age < settings.IDEMPOTENCY_STALE_SECONDS:
-                raise conflict(
-                    f"A request with Idempotency-Key '{key}' is already being processed."
-                )
-            session.query(IdempotencyRecord).filter_by(key=key).delete()
-            session.commit()
-            # Loop and re-insert; a concurrent recovery loses on the unique index.
-            continue
-
-
-def store_completed_response(session: Session, key: str, response: dict) -> None:
-    record = session.get(IdempotencyRecord, key)
-    if record is None:  # pragma: no cover - defensive
-        record = IdempotencyRecord(key=key, content_hash="", state="completed")
-        session.add(record)
-    record.state = "completed"
-    record.status_code = 200
-    record.response = response
-
-
-# --------------------------------------------------------------------------- #
 # Transactional processing
 # --------------------------------------------------------------------------- #
 
@@ -368,11 +318,19 @@ def process_bundle(session: Session, bundle: dict, idempotency_key: str) -> dict
     entries = validate_bundle(bundle)
     hash_value = content_hash(bundle)
 
-    replay = acquire_idempotency_slot(session, idempotency_key, hash_value)
-    if replay is not None:
-        return _canonicalize(replay)
+    outcome = acquire_slot(hash_value, idempotency_key)
+    if outcome.replay is not None:
+        return _canonicalize(outcome.replay)
+    lease: SlotLease = outcome.lease  # type: ignore[assignment]
 
     try:
+        # Optional, env-gated pause used by scripts/demo_retry_recovery.sh to
+        # hold a request demonstrably in-flight. Disabled (empty/unset) in
+        # production and in the test suite.
+        delay = os.getenv("DEMO_PROCESSING_DELAY_SECONDS")
+        if delay:  # pragma: no cover - demo/observability hook only
+            time.sleep(float(delay))
+
         patient_entries = [e for e in entries if e.resource_type == "Patient"]
         observation_entries = [e for e in entries if e.resource_type == "Observation"]
         report_entries = [e for e in entries if e.resource_type == "DiagnosticReport"]
@@ -388,24 +346,34 @@ def process_bundle(session: Session, bundle: dict, idempotency_key: str) -> dict
         _apply_reports(session, report_entries, report_rows, obs_rows, entries)
 
         receipt = _build_receipt(entries, idempotency_key)
-        store_completed_response(session, idempotency_key, receipt)
+        if not complete_slot(session, lease, receipt):
+            # The slot was recovered while we were processing: another request
+            # now owns the key. Roll back every resource write rather than
+            # duplicating observations/reports or overwriting its receipt.
+            session.rollback()
+            raise conflict(
+                f"Idempotency-Key '{idempotency_key}' was recovered by another "
+                f"request after the stale threshold; this attempt was discarded."
+            )
         session.commit()
         return _canonicalize(receipt)
     except FhirError:
-        # Roll back all resource writes and release the idempotency slot so the
-        # caller may correct the payload and retry with the same accession key.
+        # Roll back all resource writes first, then release the idempotency slot
+        # (fenced, in its own transaction) so the caller may correct the payload
+        # and retry with the same accession key. If ownership was lost the
+        # delete affects nothing and the later request's receipt is preserved.
         session.rollback()
-        session.query(IdempotencyRecord).filter_by(key=idempotency_key).delete()
-        session.commit()
+        release_slot(lease)
         raise
     except Exception:
         session.rollback()
         try:
-            session.query(IdempotencyRecord).filter_by(key=idempotency_key).delete()
-            session.commit()
+            release_slot(lease)
         except Exception:  # pragma: no cover - defensive
-            session.rollback()
+            pass
         raise
+    finally:
+        lease.stop_heartbeat()
 
 
 # --------------------------------------------------------------------------- #

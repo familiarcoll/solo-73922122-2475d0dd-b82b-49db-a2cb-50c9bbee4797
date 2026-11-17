@@ -15,15 +15,46 @@ services:
       timeout: 3s
       retries: 20
 
-  api:
+  # Two independent API instances (separate containers/processes, same DB).
+  # Any instance serves any request; idempotency fencing makes cross-instance
+  # retries and crash recovery safe. See scripts/demo_retry_recovery.sh.
+  api1:
     build: .
     depends_on:
       db:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+psycopg2://research:research@db:5432/researchdb
+      IDEMPOTENCY_STALE_SECONDS: "60"
+      IDEMPOTENCY_HEARTBEAT_SECONDS: "20"
+      # Demo/observability hook (empty disables it): hold each submission inside
+      # processing for this many seconds so scripts/demo_retry_recovery.sh can
+      # show a request being genuinely in-flight. Unset for normal operation.
+      DEMO_PROCESSING_DELAY_SECONDS: "3"
     ports:
-      - "8000:8000"
+      - "8001:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api2:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://research:research@db:5432/researchdb
+      IDEMPOTENCY_STALE_SECONDS: "60"
+      IDEMPOTENCY_HEARTBEAT_SECONDS: "20"
+    ports:
+      - "8002:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
 volumes:
   pgdata:

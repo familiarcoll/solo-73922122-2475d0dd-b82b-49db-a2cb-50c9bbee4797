@@ -146,7 +146,22 @@ class ResourceVersion(Base):
 
 
 class IdempotencyRecord(Base):
-    """Idempotency / exactly-once ledger for submitted Bundles."""
+    """Idempotency / exactly-once ledger for submitted Bundles.
+
+    Concurrency model across API instances:
+
+    * ``state`` is pending | completed | failed.
+    * A live request owns its row: ``owner_id`` identifies the process/thread
+      and ``fence_version`` is incremented every time the slot changes hands
+      (initial insert or crash recovery).
+    * ``heartbeat_at`` is refreshed by a background heartbeat while the owner is
+      alive. A pending row whose heartbeat is older than the stale threshold is
+      presumed crashed and may be recovered exactly once via a conditional
+      update on ``fence_version``.
+    * Every terminal write (completion, failure cleanup) is conditional on
+      ``(owner_id, fence_version)`` so a superseded ("zombie") owner can never
+      overwrite or delete a later request's receipt.
+    """
 
     __tablename__ = "idempotency_records"
 
@@ -160,3 +175,12 @@ class IdempotencyRecord(Base):
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Owner of the current pending attempt; NULL on terminal rows.
+    owner_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Bumped on every ownership change; the fencing token for conditional writes.
+    fence_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # Last liveness heartbeat; falls back to updated_at/created_at for rows
+    # written by older code.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

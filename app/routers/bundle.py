@@ -1,6 +1,8 @@
 """Bundle submission endpoint."""
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
@@ -12,13 +14,24 @@ from app.services.bundle import process_bundle
 router = APIRouter(tags=["bundle"])
 
 
+async def _request_body(request: Request) -> bytes:
+    # Async dependency: runs on the event loop where the ASGI receive channel
+    # lives, so the synchronous threadpool endpoint below still gets the body.
+    return await request.body()
+
+
 @router.post("/fhir")
-async def submit_transaction_bundle(
-    request: Request,
+def submit_transaction_bundle(
+    raw_body: bytes = Depends(_request_body),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     session: Session = Depends(get_session),
 ):
     """Accept a FHIR R4 transaction Bundle (Patient/Observation/DiagnosticReport).
+
+    Defined as a synchronous ``def`` endpoint so FastAPI executes it in the
+    shared threadpool: a slow bundle (or a retried request blocked on 409) does
+    not stall the event loop, and reads plus unrelated patients' submissions keep
+    flowing on both API instances.
 
     The ``Idempotency-Key`` header (the laboratory accession/order number) makes
     retries safe: an identical body replays the original receipt, a different
@@ -30,7 +43,7 @@ async def submit_transaction_bundle(
             "Header 'Idempotency-Key' (accession/order number) is required."
         )
     try:
-        bundle = await request.json()
+        bundle = json.loads(raw_body)
     except Exception:
         raise bad_request("Request body is not valid JSON.")
     receipt = process_bundle(session, bundle, idempotency_key.strip())

@@ -1,8 +1,10 @@
 """Shared pytest fixtures.
 
-Tests run against a real PostgreSQL by default (DATABASE_URL env). A SQLite
-fallback keeps the suite runnable offline; locking-dependent concurrency tests
-are skipped there.
+Tests run against a real PostgreSQL when DATABASE_URL points at one (the
+Docker/CI profile). A SQLite fallback keeps the full suite runnable offline;
+locking-dependent concurrency tests skip themselves there, while the
+idempotency retry/recovery interleavings are exercised on every profile
+because they rely on fenced conditional UPDATEs, not dialect-specific locks.
 """
 from __future__ import annotations
 
@@ -11,30 +13,22 @@ import uuid
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-os.environ.setdefault(
-    "DATABASE_URL",
-    "postgresql+psycopg2://research@localhost:5433/researchdb_test?host=/tmp",
-)
+# PostgreSQL when provided (docker/CI), otherwise an offline SQLite database.
+_DEFAULT_SQLITE = "sqlite:////tmp/researchdb_test.sqlite3"
+os.environ.setdefault("DATABASE_URL", os.getenv("TEST_DATABASE_URL", _DEFAULT_SQLITE))
 
 from app import database  # noqa: E402
-from app.database import Base  # noqa: E402
+from app.database import Base, make_engine  # noqa: E402
 from app.main import app  # noqa: E402
 
 
 @pytest.fixture(scope="session")
 def engine():
-    eng = create_engine(
-        os.environ["DATABASE_URL"],
-        future=True,
-        **(
-            {"connect_args": {"check_same_thread": False}}
-            if os.environ["DATABASE_URL"].startswith("sqlite")
-            else {}
-        ),
-    )
+    # Reuse the app's engine factory so SQLite transaction fixes apply in tests
+    # exactly as they do in the running service.
+    eng = make_engine(os.environ["DATABASE_URL"])
     Base.metadata.drop_all(bind=eng)
     Base.metadata.create_all(bind=eng)
     yield eng
@@ -56,6 +50,25 @@ def db_session(engine):
     session.close()
     transaction.rollback()
     connection.close()
+
+
+@pytest.fixture(autouse=True)
+def _disable_background_heartbeat(monkeypatch):
+    """Default: no background heartbeat threads (deterministic, SQLite-safe).
+
+    Tests that exercise liveness explicitly opt back in by setting
+    IDEMPOTENCY_HEARTBEAT_SECONDS to a small value.
+    """
+    from app.config import settings
+    from app.services import idempotency
+
+    monkeypatch.setattr(settings, "IDEMPOTENCY_HEARTBEAT_SECONDS", 10_000_000)
+    monkeypatch.setattr(
+        idempotency.SlotHeartbeat,
+        "start",
+        lambda self: self,
+    )
+    yield
 
 
 @pytest.fixture()
